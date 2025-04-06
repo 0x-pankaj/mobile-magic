@@ -7,6 +7,7 @@ import { Writable } from "stream";
 import { DOMAIN } from "./config";
 import { prismaClient } from "db/client";
 import promClient from "prom-client";
+import AWS from "aws-sdk";
 
 const containerCreateBucket = new promClient.Histogram({
   name: "container_create_bucket",
@@ -17,6 +18,10 @@ const containerCreateBucket = new promClient.Histogram({
 
 const kc = new KubeConfig();
 const app = express();
+
+const s3 = new AWS.S3({
+  region: "",
+});
 
 const PROJECT_TYPE_TO_BASE_FOLDER = {
   NEXTJS: "/tmp/next-app",
@@ -44,7 +49,38 @@ async function listPods(): Promise<string[]> {
     .map((pod) => pod.metadata?.name as string);
 }
 
-async function createPod(name: string, projectType: ProjectType) {
+enum ProjectType {
+  REACT_NATIVE = "REACT_NATIVE",
+  REACT = "REACT",
+  NEXTJS = "NEXTJS",
+}
+
+const PROJECT_TYPE_TO_BASE_IMAGE: Record<ProjectType, string> = {
+  [ProjectType.NEXTJS]: "100xdevs/code-server-nextjs:v3", //100xdevs/code-server-base:v3
+  [ProjectType.REACT]: "100xdevs/code-server-react:v3",
+  [ProjectType.REACT_NATIVE]: "100xdevs/code-server-reactnative-expo:v3",
+};
+
+const RUNTIME_TO_BASE_IMAGE: Record<string, string> = {
+  nodejs: "100xdevs/code-server-nodejs:v1", // Base image with Node.js only
+  rust: "100xdevs/code-server-rust:v1", // Base image with Rust only
+  nodejs_rust: "100xdevs/code-server-nodejs-rust:v1", // Base image with Node.js and Rust
+};
+
+//determing runtime based on project type
+function getRuntimeForProjectType(projectType: ProjectType): string {
+  switch (projectType) {
+    case ProjectType.NEXTJS:
+    case ProjectType.REACT:
+      return "nodejs";
+    case ProjectType.REACT_NATIVE:
+      return "nodejs";
+    default:
+      return "nodejs"; // Default to Node.js
+  }
+}
+
+async function createPod(name: string, image: string) {
   await k8sApi.createNamespacedPod({
     namespace: "user-apps",
     body: {
@@ -58,7 +94,7 @@ async function createPod(name: string, projectType: ProjectType) {
         containers: [
           {
             name: "code-server",
-            image: PROJECT_TYPE_TO_IMAGE[projectType],
+            image: image, //here  adding dynamic image //100xdevs/code-server-base:v3
             ports: [{ containerPort: 8080 }, { containerPort: 8081 }],
           },
           {
@@ -173,25 +209,22 @@ async function checkPodIsReady(name: string) {
   }
 }
 
-enum ProjectType {
-  REACT_NATIVE = "REACT_NATIVE",
-  NEXTJS = "NEXTJS",
-  REACT = "REACT",
-}
-
-const PROJECT_TYPE_TO_IMAGE: Record<ProjectType, string> = {
-  [ProjectType.NEXTJS]: "100xdevs/code-server-nextjs:v3", //100xdevs/code-server-base:v3
-  [ProjectType.REACT]: "100xdevs/code-server-react:v3",
-  [ProjectType.REACT_NATIVE]: "100xdevs/code-server-react:v3",
-};
-
-async function assignPodToProject(projectId: string, projectType: ProjectType) {
+async function assignPodToProject(
+  projectId: string,
+  projectType: ProjectType,
+  isOnS3: boolean,
+) {
   const pods = await listPods();
   const podExists = pods.find((pod) => pod === projectId);
+
+  //determing base image
+  const image = isOnS3
+    ? RUNTIME_TO_BASE_IMAGE[getRuntimeForProjectType(projectType)]
+    : PROJECT_TYPE_TO_BASE_IMAGE[projectType];
+
   if (!podExists) {
     console.log("Pod does not exist, creating pod");
-
-    await createPod(projectId, projectType);
+    await createPod(projectId, image);
   }
 
   console.log("Pod exists, checking if it is ready");
@@ -201,41 +234,95 @@ async function assignPodToProject(projectId: string, projectType: ProjectType) {
   const exec = new k8s.Exec(kc);
   let stdout = "";
   let stderr = "";
-  console.log(`mv ${PROJECT_TYPE_TO_BASE_FOLDER[projectType]}/* /app`);
 
-  exec.exec(
-    "user-apps",
-    projectId,
-    "code-server",
-    ["/bin/sh", "-c", `mv ${PROJECT_TYPE_TO_BASE_FOLDER[projectType]}/* /app`],
-    new Writable({
-      write: (
-        chunk: Buffer,
-        encoding: BufferEncoding,
-        callback: () => void,
-      ) => {
-        stdout += chunk;
-        callback();
+  if (isOnS3) {
+    //pulling code from S3
+    const s3Bucket = "";
+    const s3Key = "";
+
+    const command = [
+      "/bin/sh",
+      "-c",
+      `aws s3 cp s3://${s3Bucket}/${s3Key} /tmp/code.zip && unzip /tmp/code.zip -d /app && rm /tmp/code.zip`,
+    ];
+    await new Promise((resolve, reject) => {
+      exec.exec(
+        "user-apps",
+        projectId,
+        "code-server",
+        command,
+        new Writable({
+          write: (
+            chunk: Buffer,
+            encoding: BufferEncoding,
+            callback: () => void,
+          ) => {
+            stdout += chunk;
+            callback();
+          },
+        }),
+        new Writable({
+          write: (
+            chunk: Buffer,
+            encoding: BufferEncoding,
+            callback: () => void,
+          ) => {
+            stderr += chunk;
+            callback();
+          },
+        }),
+        null,
+        false,
+        (status) => {
+          console.log("Exec status:", status);
+          console.log("Stdout:", stdout);
+          console.log("Stderr:", stderr);
+          if (status?.status === "Success") resolve(status);
+          else reject(new Error("Failed to pull and extract S3 code"));
+        },
+      );
+    });
+  } else {
+    console.log(`mv ${PROJECT_TYPE_TO_BASE_FOLDER[projectType]}/* /app`);
+
+    exec.exec(
+      "user-apps",
+      projectId,
+      "code-server",
+      [
+        "/bin/sh",
+        "-c",
+        `mv ${PROJECT_TYPE_TO_BASE_FOLDER[projectType]}/* /app`,
+      ],
+      new Writable({
+        write: (
+          chunk: Buffer,
+          encoding: BufferEncoding,
+          callback: () => void,
+        ) => {
+          stdout += chunk;
+          callback();
+        },
+      }),
+      new Writable({
+        write: (
+          chunk: Buffer,
+          encoding: BufferEncoding,
+          callback: () => void,
+        ) => {
+          stderr += chunk;
+          callback();
+        },
+      }),
+      null,
+      false,
+      (status) => {
+        console.log(status);
+        console.log(stdout);
+        console.log(stderr);
       },
-    }),
-    new Writable({
-      write: (
-        chunk: Buffer,
-        encoding: BufferEncoding,
-        callback: () => void,
-      ) => {
-        stderr += chunk;
-        callback();
-      },
-    }),
-    null,
-    false,
-    (status) => {
-      console.log(status);
-      console.log(stdout);
-      console.log(stderr);
-    },
-  );
+    );
+  }
 
   await new Promise((resolve) => setTimeout(resolve, 1000));
   console.log(stdout);
@@ -256,17 +343,21 @@ app.get("/worker/:projectId", async (req, res) => {
     },
   });
 
-  const projectType = project?.type;
-
   if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;
   }
 
+  const projectType = project.type as ProjectType;
+  const isOnS3 = project.onS3;
+  //if code is on s3 then we don't needed baseimage with initial code
+  // only needed baseimage with respective run time
+
   console.log("Project found, assigning to pod");
   const startTime = Date.now();
-  //assigning project accourding to type user requested
-  await assignPodToProject(projectId, projectType! as ProjectType);
+
+  await assignPodToProject(projectId, projectType, isOnS3); //argument as projectType
+
   console.log("Pod assigned, sending response");
   containerCreateBucket.observe({ type: project.type }, Date.now() - startTime);
 

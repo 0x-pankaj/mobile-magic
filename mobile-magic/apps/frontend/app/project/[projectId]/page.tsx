@@ -13,6 +13,7 @@ export default async function ProjectPage({ params }: Params) {
   const response = await axios.get(
     `${K8S_ORCHESTRATOR_URL}/worker/${projectId}`,
   );
+  console.log("response from orchestrator worker : ", response);
   const { sessionUrl, previewUrl, workerUrl } = response.data;
 
   return (
